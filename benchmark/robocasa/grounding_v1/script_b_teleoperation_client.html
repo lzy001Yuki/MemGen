@@ -1,0 +1,655 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Robocasa Teleoperation Client</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .header h1 {
+            font-size: 24px;
+            font-weight: 600;
+        }
+
+        .status-badge {
+            padding: 8px 16px;
+            border-radius: 20px;
+            background: rgba(255, 255, 255, 0.2);
+            font-size: 14px;
+            font-weight: 500;
+        }
+
+        .status-badge.connected {
+            background: #10b981;
+        }
+
+        .status-badge.disconnected {
+            background: #ef4444;
+        }
+
+        .status-badge.recording {
+            background: #f59e0b;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+
+        .main-content {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 20px;
+            padding: 30px;
+        }
+
+        .video-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .video-container {
+            position: relative;
+            background: #000;
+            border-radius: 8px;
+            overflow: hidden;
+            aspect-ratio: 4/3;
+        }
+
+        .video-container img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+
+        .video-label {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 5px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .phase-indicator {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(102, 126, 234, 0.9);
+            color: white;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: 600;
+        }
+
+        .control-panel {
+            background: #f9fafb;
+            border-radius: 8px;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .control-section {
+            background: white;
+            border-radius: 8px;
+            padding: 15px;
+            border: 1px solid #e5e7eb;
+        }
+
+        .control-section h3 {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 15px;
+            color: #374151;
+        }
+
+        .button-group {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+        }
+
+        .btn {
+            padding: 12px 20px;
+            border: none;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-align: center;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+        }
+
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #5568d3;
+        }
+
+        .btn-success {
+            background: #10b981;
+            color: white;
+        }
+
+        .btn-success:hover {
+            background: #059669;
+        }
+
+        .btn-danger {
+            background: #ef4444;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #dc2626;
+        }
+
+        .btn-secondary {
+            background: #6b7280;
+            color: white;
+        }
+
+        .btn-secondary:hover {
+            background: #4b5563;
+        }
+
+        .joystick-container {
+            position: relative;
+            width: 200px;
+            height: 200px;
+            margin: 20px auto;
+            background: #e5e7eb;
+            border-radius: 50%;
+            border: 3px solid #9ca3af;
+        }
+
+        .joystick-knob {
+            position: absolute;
+            width: 60px;
+            height: 60px;
+            background: #667eea;
+            border-radius: 50%;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            cursor: grab;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+            transition: background 0.2s;
+        }
+
+        .joystick-knob:active {
+            cursor: grabbing;
+            background: #5568d3;
+        }
+
+        .slider-group {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .slider-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .slider-item label {
+            font-size: 12px;
+            color: #6b7280;
+            min-width: 80px;
+        }
+
+        .slider-item input[type="range"] {
+            flex: 1;
+            height: 6px;
+            border-radius: 3px;
+            background: #e5e7eb;
+            outline: none;
+        }
+
+        .slider-item input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: #667eea;
+            cursor: pointer;
+        }
+
+        .slider-item span {
+            font-size: 12px;
+            font-weight: 600;
+            color: #374151;
+            min-width: 40px;
+            text-align: right;
+        }
+
+        .info-panel {
+            background: white;
+            border-radius: 8px;
+            padding: 15px;
+            border: 1px solid #e5e7eb;
+            font-size: 13px;
+            line-height: 1.8;
+        }
+
+        .info-panel strong {
+            color: #667eea;
+        }
+
+        .keyboard-hints {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 8px;
+            margin-top: 10px;
+        }
+
+        .keyboard-hint {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+        }
+
+        .key-badge {
+            background: #667eea;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-weight: 600;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 Robocasa Teleoperation</h1>
+            <div id="statusBadge" class="status-badge disconnected">Disconnected</div>
+        </div>
+
+        <div class="main-content">
+            <div class="video-panel">
+                <div class="video-container">
+                    <img id="rgbStream" src="" alt="RGB Camera">
+                    <div class="video-label">RGB Camera</div>
+                    <div id="phaseIndicator" class="phase-indicator">Phase 1</div>
+                </div>
+                <div class="video-container">
+                    <img id="depthStream" src="" alt="Depth Camera">
+                    <div class="video-label">Depth Camera</div>
+                </div>
+            </div>
+
+            <div class="control-panel">
+                <div class="control-section">
+                    <h3>📹 Recording Control</h3>
+                    <div class="button-group">
+                        <button id="startRecording" class="btn btn-success">Start Recording</button>
+                        <button id="stopRecording" class="btn btn-danger" disabled>Stop Recording</button>
+                        <button id="resetEnv" class="btn btn-secondary">Reset Environment</button>
+                    </div>
+                </div>
+
+                <div class="control-section">
+                    <h3>🕹️ Virtual Joystick</h3>
+                    <div class="joystick-container" id="joystickContainer">
+                        <div class="joystick-knob" id="joystickKnob"></div>
+                    </div>
+                </div>
+
+                <div class="control-section">
+                    <h3>🎚️ Joint Control</h3>
+                    <div class="slider-group" id="sliderGroup">
+                        <!-- Dynamically generated sliders -->
+                    </div>
+                </div>
+
+                <div class="info-panel">
+                    <strong>Keyboard Shortcuts:</strong>
+                    <div class="keyboard-hints">
+                        <div class="keyboard-hint">
+                            <span class="key-badge">R</span>
+                            <span>Start/Stop Recording</span>
+                        </div>
+                        <div class="keyboard-hint">
+                            <span class="key-badge">Space</span>
+                            <span>Reset Environment</span>
+                        </div>
+                        <div class="keyboard-hint">
+                            <span class="key-badge">WASD</span>
+                            <span>XY Movement</span>
+                        </div>
+                        <div class="keyboard-hint">
+                            <span class="key-badge">QE</span>
+                            <span>Z Movement</span>
+                        </div>
+                        <div class="keyboard-hint">
+                            <span class="key-badge">G</span>
+                            <span>Toggle Gripper</span>
+                        </div>
+                    </div>
+                    <div style="margin-top: 15px;">
+                        <strong>Status:</strong> <span id="statusText">Initializing...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // WebSocket connection
+        let ws = null;
+        let isRecording = false;
+        let actionDim = 7; // Default 7-DOF
+        let currentAction = new Array(actionDim).fill(0.0);
+
+        // Session ID (can be customized)
+        const sessionId = 'user_' + Date.now();
+
+        // Initialize WebSocket
+        function initWebSocket() {
+            const wsUrl = `ws://${window.location.host}/ws/${sessionId}`;
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                updateStatus('connected', 'Connected');
+            };
+
+            ws.onmessage = (event) => {
+                const message = JSON.parse(event.data);
+                handleMessage(message);
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket disconnected');
+                updateStatus('disconnected', 'Disconnected');
+                setTimeout(initWebSocket, 3000); // Reconnect after 3s
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+            };
+        }
+
+        // Handle incoming messages
+        function handleMessage(message) {
+            const { type, data } = message;
+
+            switch (type) {
+                case 'init':
+                    actionDim = message.action_space_shape;
+                    currentAction = new Array(actionDim).fill(0.0);
+                    initializeSliders();
+                    document.getElementById('statusText').textContent = `Initialized (${actionDim}-DOF)`;
+                    break;
+
+                case 'frame':
+                    document.getElementById('rgbStream').src = data.rgb;
+                    document.getElementById('depthStream').src = data.depth;
+                    break;
+
+                case 'step_result':
+                    if (data.info && data.info.current_phase) {
+                        document.getElementById('phaseIndicator').textContent = `Phase ${data.info.current_phase}`;
+                    }
+                    break;
+
+                case 'recording_status':
+                    isRecording = message.recording;
+                    updateRecordingUI();
+                    if (!isRecording && message.saved_path) {
+                        document.getElementById('statusText').textContent = `Saved: ${message.saved_path}`;
+                    }
+                    break;
+
+                case 'reset_complete':
+                    document.getElementById('statusText').textContent = 'Environment reset';
+                    break;
+            }
+        }
+
+        // Update status badge
+        function updateStatus(state, text) {
+            const badge = document.getElementById('statusBadge');
+            badge.className = `status-badge ${state}`;
+            badge.textContent = text;
+        }
+
+        // Initialize joint sliders
+        function initializeSliders() {
+            const container = document.getElementById('sliderGroup');
+            container.innerHTML = '';
+
+            for (let i = 0; i < Math.min(actionDim, 6); i++) {
+                const div = document.createElement('div');
+                div.className = 'slider-item';
+
+                div.innerHTML = `
+                    <label>Joint ${i + 1}</label>
+                    <input type="range" id="slider${i}" min="-1" max="1" step="0.01" value="0">
+                    <span id="value${i}">0.00</span>
+                `;
+
+                container.appendChild(div);
+
+                const slider = document.getElementById(`slider${i}`);
+                const valueSpan = document.getElementById(`value${i}`);
+
+                slider.addEventListener('input', (e) => {
+                    const value = parseFloat(e.target.value);
+                    currentAction[i] = value;
+                    valueSpan.textContent = value.toFixed(2);
+                    sendControlCommand();
+                });
+            }
+        }
+
+        // Send control command
+        function sendControlCommand() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'control',
+                    command: {
+                        type: 'velocity',
+                        values: currentAction
+                    }
+                }));
+            }
+        }
+
+        // Joystick control
+        let joystickActive = false;
+        const joystickContainer = document.getElementById('joystickContainer');
+        const joystickKnob = document.getElementById('joystickKnob');
+
+        joystickKnob.addEventListener('mousedown', () => {
+            joystickActive = true;
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!joystickActive) return;
+
+            const rect = joystickContainer.getBoundingClientRect();
+            const centerX = rect.left + rect.width / 2;
+            const centerY = rect.top + rect.height / 2;
+
+            let dx = e.clientX - centerX;
+            let dy = e.clientY - centerY;
+
+            const maxRadius = rect.width / 2 - 30;
+            const distance = Math.sqrt(dx * dx + dy * dy);
+
+            if (distance > maxRadius) {
+                dx = (dx / distance) * maxRadius;
+                dy = (dy / distance) * maxRadius;
+            }
+
+            joystickKnob.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
+
+            // Map to action space (x, y velocities)
+            currentAction[0] = dx / maxRadius;
+            currentAction[1] = -dy / maxRadius; // Invert Y
+            sendControlCommand();
+        });
+
+        document.addEventListener('mouseup', () => {
+            if (joystickActive) {
+                joystickActive = false;
+                joystickKnob.style.transform = 'translate(-50%, -50%)';
+                currentAction[0] = 0;
+                currentAction[1] = 0;
+                sendControlCommand();
+            }
+        });
+
+        // Recording controls
+        document.getElementById('startRecording').addEventListener('click', () => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'start_recording' }));
+                isRecording = true;
+                updateRecordingUI();
+            }
+        });
+
+        document.getElementById('stopRecording').addEventListener('click', () => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'stop_recording' }));
+                isRecording = false;
+                updateRecordingUI();
+            }
+        });
+
+        document.getElementById('resetEnv').addEventListener('click', () => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'reset' }));
+            }
+        });
+
+        function updateRecordingUI() {
+            document.getElementById('startRecording').disabled = isRecording;
+            document.getElementById('stopRecording').disabled = !isRecording;
+
+            if (isRecording) {
+                updateStatus('recording', '⏺ Recording');
+            } else {
+                updateStatus('connected', 'Connected');
+            }
+        }
+
+        // Keyboard controls
+        const keyState = {};
+
+        document.addEventListener('keydown', (e) => {
+            keyState[e.key.toLowerCase()] = true;
+
+            // Recording shortcut
+            if (e.key.toLowerCase() === 'r') {
+                if (isRecording) {
+                    document.getElementById('stopRecording').click();
+                } else {
+                    document.getElementById('startRecording').click();
+                }
+            }
+
+            // Reset shortcut
+            if (e.key === ' ') {
+                e.preventDefault();
+                document.getElementById('resetEnv').click();
+            }
+
+            updateActionFromKeyboard();
+        });
+
+        document.addEventListener('keyup', (e) => {
+            keyState[e.key.toLowerCase()] = false;
+            updateActionFromKeyboard();
+        });
+
+        function updateActionFromKeyboard() {
+            const speed = 0.5;
+
+            // XY movement (WASD)
+            let vx = 0, vy = 0, vz = 0;
+
+            if (keyState['w']) vy += speed;
+            if (keyState['s']) vy -= speed;
+            if (keyState['a']) vx -= speed;
+            if (keyState['d']) vx += speed;
+
+            // Z movement (QE)
+            if (keyState['q']) vz += speed;
+            if (keyState['e']) vz -= speed;
+
+            currentAction[0] = vx;
+            currentAction[1] = vy;
+            currentAction[2] = vz;
+
+            // Gripper (G)
+            if (keyState['g']) {
+                currentAction[actionDim - 1] = currentAction[actionDim - 1] > 0 ? -1 : 1;
+            }
+
+            sendControlCommand();
+        }
+
+        // Initialize on page load
+        window.addEventListener('load', () => {
+            initWebSocket();
+        });
+    </script>
+</body>
+</html>
