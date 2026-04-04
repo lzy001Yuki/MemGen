@@ -34,65 +34,76 @@ from script_a_automated_recording import RobomimicHDF5Writer, TrajectoryBuffer
 
 class HeadlessRenderer:
     """
-    Headless rendering using mujoco.Renderer for offscreen image generation.
+    Headless rendering using robosuite's camera system.
     """
 
-    def __init__(self, model: mujoco.MjModel, width: int = 640, height: int = 480):
+    def __init__(self, env, camera_names: List[str] = None):
         """
         Initialize headless renderer.
 
         Args:
-            model: MuJoCo model
-            width: Image width in pixels
-            height: Image height in pixels
+            env: Robosuite/robocasa environment
+            camera_names: List of camera names to use
         """
-        self.model = model
-        self.width = width
-        self.height = height
+        self.env = env
+        self.camera_names = camera_names or ["robot0_agentview_center", "robot0_eye_in_hand"]
+        self.width = 640
+        self.height = 480
 
-        # Create offscreen renderer
-        self.renderer = mujoco.Renderer(model, height=height, width=width)
+        # Set environment to use camera observations
+        if hasattr(env, 'camera_names'):
+            env.camera_names = self.camera_names
+            env.camera_heights = [self.height] * len(self.camera_names)
+            env.camera_widths = [self.width] * len(self.camera_names)
 
-        # Camera configuration
-        self.camera_id = 0  # Default camera
-
-    def render_rgb(self, data: mujoco.MjData) -> np.ndarray:
+    def render_rgb(self, camera_name: str = None) -> np.ndarray:
         """
-        Render RGB image from current simulation state.
+        Render RGB image from specified camera.
 
         Args:
-            data: MuJoCo data instance
+            camera_name: Camera name to render from (uses first camera if None)
 
         Returns:
             RGB image array (H, W, 3) uint8
         """
-        # Update scene
-        self.renderer.update_scene(data, camera=self.camera_id)
+        if camera_name is None:
+            camera_name = self.camera_names[0]
 
-        # Render RGB
-        rgb = self.renderer.render()
+        # Use robosuite's sim.render
+        rgb = self.env.sim.render(
+            camera_name=camera_name,
+            height=self.height,
+            width=self.width,
+            depth=False
+        )
+
+        # Flip image (robosuite renders upside down)
+        rgb = np.flipud(rgb)
         return rgb
 
-    def render_depth(self, data: mujoco.MjData) -> np.ndarray:
+    def render_depth(self, camera_name: str = None) -> np.ndarray:
         """
-        Render depth image from current simulation state.
+        Render depth image from specified camera.
 
         Args:
-            data: MuJoCo data instance
+            camera_name: Camera name to render from (uses first camera if None)
 
         Returns:
             Depth image array (H, W) float32
         """
-        # Enable depth rendering
-        self.renderer.enable_depth_rendering()
+        if camera_name is None:
+            camera_name = self.camera_names[0]
 
-        # Update and render
-        self.renderer.update_scene(data, camera=self.camera_id)
-        depth = self.renderer.render()
+        # Render with depth
+        _, depth = self.env.sim.render(
+            camera_name=camera_name,
+            height=self.height,
+            width=self.width,
+            depth=True
+        )
 
-        # Disable depth for next RGB render
-        self.renderer.disable_depth_rendering()
-
+        # Flip depth (robosuite renders upside down)
+        depth = np.flipud(depth)
         return depth
 
     def encode_image_base64(self, image: np.ndarray) -> str:
@@ -241,11 +252,11 @@ class TeleoperationSession:
             Dictionary with base64-encoded images
         """
         # Render RGB
-        rgb = self.renderer.render_rgb(self.env.sim.data)
+        rgb = self.renderer.render_rgb()
         rgb_b64 = self.renderer.encode_image_base64(rgb)
 
         # Render Depth
-        depth = self.renderer.render_depth(self.env.sim.data)
+        depth = self.renderer.render_depth()
         depth_b64 = self.renderer.encode_image_base64(depth)
 
         return {
@@ -296,26 +307,41 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     await websocket.accept()
     print(f"Client connected: {session_id}")
 
-    # Create environment and session
-    env = LongHorizonTask(**env_config)
-    obs, info = env.reset()
+    try:
+        # Create environment and session
+        print(f"[{session_id}] Creating environment...")
+        env = LongHorizonTask(**env_config)
 
-    renderer = HeadlessRenderer(
-        model=env.sim.model,
-        width=640,
-        height=480
-    )
+        print(f"[{session_id}] Resetting environment...")
+        obs, info = env.reset()
 
-    session = TeleoperationSession(env, renderer, session_id)
-    session.current_obs = obs
-    active_sessions[session_id] = session
+        print(f"[{session_id}] Creating renderer...")
+        renderer = HeadlessRenderer(env=env)
 
-    # Send initial state
-    await websocket.send_json({
-        "type": "init",
-        "action_space_shape": env.action_space.shape[0],
-        "episode_meta": env.get_ep_meta(),
-    })
+        session = TeleoperationSession(env, renderer, session_id)
+        session.current_obs = obs
+        active_sessions[session_id] = session
+
+        # Send initial state
+        await websocket.send_json({
+            "type": "init",
+            "action_space_shape": env.action_space.shape[0],
+            "episode_meta": env.get_ep_meta(),
+        })
+
+        print(f"[{session_id}] Initialization complete")
+
+    except Exception as e:
+        print(f"[{session_id}] Initialization failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+        await websocket.send_json({
+            "type": "error",
+            "message": f"Environment initialization failed: {str(e)}"
+        })
+        await websocket.close()
+        return
 
     try:
         # Main loop

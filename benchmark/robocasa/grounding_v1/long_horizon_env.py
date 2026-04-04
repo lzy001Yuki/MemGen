@@ -52,6 +52,9 @@ class LongHorizonTask(Kitchen):
         object_type: str = "apple",
         container_type: str = "microwave",
         num_intermediate: int = 2,
+        robots: str = "PandaMobile",
+        layout_id: int = 0,
+        style_id: int = 0,
         **kwargs
     ):
         # Validate parameters
@@ -79,8 +82,15 @@ class LongHorizonTask(Kitchen):
 
         # Intermediate task tracking
         self.intermediate_task_list = []
+        kwargs.setdefault("camera_names", ["robot0_agentview_center", "robot0_eye_in_hand"])
 
-        super().__init__(**kwargs)
+        
+        super().__init__(
+            robots=robots,
+            layout_id=layout_id,
+            style_id=style_id,
+            **kwargs
+        )
 
     def _setup_kitchen_references(self):
         """
@@ -91,7 +101,7 @@ class LongHorizonTask(Kitchen):
 
         # Get container fixture based on type
         if self.container_type == "microwave":
-            from robocasa.models.scenes.scene_registry import FixtureType
+            from robocasa.models.fixtures.fixture import FixtureType
             self.target_container = self.get_fixture(FixtureType.MICROWAVE)
         # Add support for other containers (bowls, pots) as needed
 
@@ -107,36 +117,32 @@ class LongHorizonTask(Kitchen):
         """
         cfgs = []
 
-        # Main target object - place on counter initially
+        # Main target object - place on counter near microwave
         cfgs.append(
             dict(
                 name="target_obj",
                 obj_groups=self.object_type,
-                graspable=True,
                 placement=dict(
                     fixture=self.target_container,
-                    sample_region_kwargs=dict(
-                        ref="counter",
-                    ),
-                    size=(0.05, 0.05),
-                    pos=(0.0, -0.3),
+                    size=(0.30, 0.30),
+                    pos=(0.0, -0.6),
+                    ensure_object_boundary_in_range=False,
                 ),
             )
         )
 
         # Add distractor objects for intermediate tasks
+        # Place them on the counter as well
         for i in range(self.num_intermediate):
             cfgs.append(
                 dict(
                     name=f"distractor_obj_{i}",
-                    obj_groups="graspable",
-                    graspable=True,
+                    obj_groups="food",
                     placement=dict(
                         fixture=self.target_container,
-                        sample_region_kwargs=dict(
-                            ref="counter",
-                        ),
-                        size=(0.05, 0.05),
+                        size=(0.30, 0.30),
+                        pos=(0.5 + i * 0.3, -0.6),
+                        ensure_object_boundary_in_range=False,
                     ),
                 )
             )
@@ -192,11 +198,15 @@ class LongHorizonTask(Kitchen):
         """
         if self.container_type == "microwave":
             # Get microwave body position from MuJoCo
-            body_id = mujoco.mj_name2id(
-                self.sim.model,
-                mujoco.mjtObj.mjOBJ_BODY,
-                self.target_container.name
-            )
+            # body_id = mujoco.mj_name2id(
+            #     self.sim.model,
+            #     mujoco.mjtObj.mjOBJ_BODY.value,
+            #     self.target_container.name
+            # )
+            microwave_body_name = next(
+    (name for name in self.sim.model.body_names 
+     if 'microwave' in name.lower()),None)
+            body_id = self.sim.model.body_name2id(microwave_body_name)
             return self.sim.data.xpos[body_id].copy()
         else:
             # For movable objects like bowls/pots

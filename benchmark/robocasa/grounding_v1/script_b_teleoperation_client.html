@@ -401,7 +401,17 @@
 
         // Initialize WebSocket
         function initWebSocket() {
-            const wsUrl = `ws://${window.location.host}/ws/${sessionId}`;
+            // Determine WebSocket protocol based on page protocol
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+
+            // Build WS URL relative to the current page URL so we automatically keep
+            // any reverse-proxy prefixes (e.g. ".../proxy/8000/") and auth query
+            // (e.g. "?token=...").
+            const wsUrlObj = new URL(`ws/${sessionId}`, window.location.href);
+            wsUrlObj.protocol = wsProtocol;
+            const wsUrl = wsUrlObj.toString();
+
+            console.log('Connecting to:', wsUrl);
             ws = new WebSocket(wsUrl);
 
             ws.onopen = () => {
@@ -409,9 +419,46 @@
                 updateStatus('connected', 'Connected');
             };
 
-            ws.onmessage = (event) => {
-                const message = JSON.parse(event.data);
-                handleMessage(message);
+            ws.onmessage = async (event) => {
+                let textData = null;
+                let debugMeta = null;
+
+                try {
+                    if (typeof event.data === 'string') {
+                        textData = event.data;
+                        debugMeta = { kind: 'string', length: event.data.length };
+                    } else if (event.data instanceof Blob) {
+                        debugMeta = { kind: 'blob', size: event.data.size, type: event.data.type };
+                        // Read as ArrayBuffer first so we can log hex if needed.
+                        const buf = await event.data.arrayBuffer();
+                        const bytes = new Uint8Array(buf);
+                        const hexPreview = Array.from(bytes.slice(0, 32))
+                            .map((b) => b.toString(16).padStart(2, '0'))
+                            .join(' ');
+                        debugMeta.hexPreview = hexPreview;
+                        textData = new TextDecoder('utf-8').decode(buf);
+                    } else if (event.data instanceof ArrayBuffer) {
+                        debugMeta = { kind: 'arraybuffer', byteLength: event.data.byteLength };
+                        textData = new TextDecoder('utf-8').decode(event.data);
+                    } else {
+                        textData = String(event.data);
+                        debugMeta = { kind: 'unknown', type: typeof event.data };
+                    }
+
+                    // Some reverse proxies may send non-JSON keepalive frames. Ignore those
+                    // but keep a useful debug print once.
+                    const trimmed = (textData || '').trimStart();
+                    if (!(trimmed.startsWith('{') || trimmed.startsWith('['))) {
+                        throw new Error('Non-JSON WebSocket frame');
+                    }
+
+                    const message = JSON.parse(textData);
+                    handleMessage(message);
+                } catch (error) {
+                    console.error('Failed to parse message:', error);
+                    if (debugMeta) console.error('Data meta:', debugMeta);
+                    if (typeof textData === 'string') console.error('Data preview:', textData.slice(0, 200));
+                }
             };
 
             ws.onclose = () => {
@@ -459,6 +506,15 @@
                 case 'reset_complete':
                     document.getElementById('statusText').textContent = 'Environment reset';
                     break;
+
+                case 'error':
+                    updateStatus('disconnected', 'Error');
+                    document.getElementById('statusText').textContent = `Error: ${message.message}`;
+                    console.error('Server error:', message.message);
+                    break;
+
+                default:
+                    console.log('Unknown message type:', type);
             }
         }
 
