@@ -28,7 +28,7 @@ python -m grounding_v2.scripts.collect_demos_grounding_v2 \
 
 ```bash
 python -m grounding_v2.scripts.collect_expert_demos_microwave_layout_shift \
-  --num_episodes 5 \
+  --num_episodes 1 \
   --split pretrain \
   --controller WHOLE_BODY_IK
 ```

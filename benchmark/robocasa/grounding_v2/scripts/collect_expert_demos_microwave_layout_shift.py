@@ -35,7 +35,7 @@ from grounding_v2.envs.microwave_pick_place_layout_shift import (  # noqa: F401
 )
 
 # Reuse the battle-tested expert + helpers from v1 grounding.
-from grounding.scripts.collect_expert_demos_layout_shift import (  # noqa: E402
+from grounding.scripts.collect_data import (  # noqa: E402
     DeltaPoseExpert,
     _render_rgb,
     _save_episode_npz,
@@ -78,6 +78,83 @@ def main() -> None:
         "--disable_base_nav",
         action="store_true",
         help="Disable mobile-base navigation (not recommended for this task).",
+    )
+    parser.add_argument(
+        "--mw_place_approach_dist",
+        type=float,
+        default=0.25,
+        help="Stage A: approach distance (outside) when placing into microwave.",
+    )
+    parser.add_argument(
+        "--mw_place_insert_dist",
+        type=float,
+        default=-0.02,
+        help="Stage A: insert distance (near plate) when placing into microwave. Can be negative to push deeper.",
+    )
+    parser.add_argument(
+        "--mw_place_insert_dist_candidates",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Optional override: a list of insert distances to try (in order) for Stage A placement retries.",
+    )
+    parser.add_argument(
+        "--mw_place_pre_z",
+        type=float,
+        default=0.04,
+        help="Stage A: z offset for the pre-place pose when placing into microwave.",
+    )
+    parser.add_argument(
+        "--mw_pick_approach_dist",
+        type=float,
+        default=0.25,
+        help="Stage C: approach distance (outside) when picking from microwave.",
+    )
+    parser.add_argument(
+        "--mw_pick_insert_dist",
+        type=float,
+        default=0.06,
+        help="Stage C: insert distance (near object) when picking from microwave.",
+    )
+    parser.add_argument(
+        "--mw_pick_pre_z",
+        type=float,
+        default=0.04,
+        help="Stage C: z offset for the pre-grasp pose when picking from microwave.",
+    )
+    parser.add_argument(
+        "--mw_pick_lift_z",
+        type=float,
+        default=0.18,
+        help="Stage C: lift distance after grasping the object from microwave.",
+    )
+    parser.add_argument(
+        "--debug_controller",
+        action="store_true",
+        help="Print controller interface details (input_type / cmd_dim / scales).",
+    )
+    parser.add_argument(
+        "--pick_max_attempts",
+        type=int,
+        default=6,
+        help="Stage A: max grasp retries (with XY jitter) when picking the object.",
+    )
+    parser.add_argument(
+        "--pick_jitter_xy",
+        type=float,
+        default=0.015,
+        help="Stage A: XY jitter magnitude used across grasp retries.",
+    )
+    parser.add_argument(
+        "--stage_a_max_attempts",
+        type=int,
+        default=4,
+        help="Stage A: max store attempts (pick + place) before giving up.",
+    )
+    parser.add_argument(
+        "--shift_nearest_if_static_base",
+        action="store_true",
+        help="If base cannot be actuated, move microwave to the nearest valid counter instead of the farthest.",
     )
     parser.add_argument("--camera", type=str, default="robot0_agentview_center")
     parser.add_argument("--height", type=int, default=512)
@@ -177,6 +254,18 @@ def main() -> None:
                 pos_thresh=float(args.pos_thresh),
                 settle_steps=int(args.settle_steps),
             )
+            if bool(args.debug_controller):
+                print(
+                    "[controller] arm_input_type=%s arm_cmd_dim=%s arm_action_scale=%s has_base=%s base_cmd_dim=%s base_input_type=%s"
+                    % (
+                        getattr(expert, "arm_input_type", None),
+                        getattr(expert, "arm_cmd_dim", None),
+                        getattr(expert, "arm_action_scale", None),
+                        getattr(expert, "has_base", None),
+                        getattr(expert, "base_cmd_dim", None),
+                        getattr(expert, "base_input_type", None),
+                    )
+                )
 
             states: list[np.ndarray] = []
             actions: list[np.ndarray] = []
@@ -227,27 +316,134 @@ def main() -> None:
                 pass
             _json_dump(ep_dir / "stage_a_targets.json", {"plate_pos": plate_pos.tolist(), "place_pos": place_pos.tolist()})
 
-            for act in expert.pick_object(obj_name="obj"):
-                env.step(act)
-                actions.append(np.array(act, dtype=np.float32).copy())
-                states.append(np.array(env.sim.get_state().flatten(), dtype=np.float64).copy())
-                if args.video_format != "none":
-                    record_frame(frame_i)
-                    frame_i += 1
-
-            for act in expert.place_object_into_fixture(fixture=env.microwave, place_pos=place_pos):
-                env.step(act)
-                actions.append(np.array(act, dtype=np.float32).copy())
-                states.append(np.array(env.sim.get_state().flatten(), dtype=np.float64).copy())
-                if args.video_format != "none":
-                    record_frame(frame_i)
-                    frame_i += 1
+            # Retry schedule for Stage A "place into microwave".
+            if args.mw_place_insert_dist_candidates is not None:
+                insert_candidates = [float(x) for x in args.mw_place_insert_dist_candidates]
+            else:
+                base_ins = float(args.mw_place_insert_dist)
+                insert_candidates = [
+                    base_ins,
+                    base_ins - 0.04,
+                    base_ins - 0.08,
+                    base_ins + 0.04,
+                ]
+            # De-dup while keeping order
+            _seen = set()
+            insert_candidates = [x for x in insert_candidates if not (x in _seen or _seen.add(x))]
 
             store_ok = False
-            try:
-                store_ok = bool(env._check_store_success())  # noqa: SLF001 (expert script)
-            except Exception:
-                store_ok = False
+            stage_a_attempts: list[dict[str, Any]] = []
+
+            # Used for short idle / settle steps
+            idle_arm = np.zeros(expert.arm_cmd_dim, dtype=np.float32)
+            idle_base = np.zeros(expert.base_cmd_dim, dtype=np.float32) if expert.has_base else None
+
+            for attempt_i in range(int(args.stage_a_max_attempts)):
+                ins = insert_candidates[attempt_i % len(insert_candidates)]
+
+                # If the object accidentally ended up inside the microwave (e.g., failed place),
+                # retrieve it using the fixture-aware primitive; otherwise, use a robust top-down grasp.
+                obj_inside_mw = False
+                try:
+                    obj_inside_mw = bool(OU.obj_inside_of(env, "obj", env.microwave, partial_check=True))
+                except Exception:
+                    obj_inside_mw = False
+
+                if obj_inside_mw:
+                    pick_gen = expert.pick_object_from_fixture(
+                        fixture=env.microwave,
+                        obj_name="obj",
+                        approach_dist=float(args.mw_pick_approach_dist),
+                        insert_dist=float(args.mw_pick_insert_dist),
+                        lift_z=float(args.mw_pick_lift_z),
+                        pre_z=float(args.mw_pick_pre_z),
+                    )
+                else:
+                    pick_gen = expert.pick_object_robust(
+                        obj_name="obj",
+                        max_attempts=int(args.pick_max_attempts),
+                        jitter_xy=float(args.pick_jitter_xy),
+                    )
+
+                for act in pick_gen:
+                    env.step(act)
+                    actions.append(np.array(act, dtype=np.float32).copy())
+                    states.append(np.array(env.sim.get_state().flatten(), dtype=np.float64).copy())
+                    if args.video_format != "none":
+                        record_frame(frame_i)
+                        frame_i += 1
+
+                for act in expert.place_object_into_fixture(
+                    fixture=env.microwave,
+                    place_pos=place_pos,
+                    approach_dist=float(args.mw_place_approach_dist),
+                    insert_dist=float(ins),
+                    pre_z=float(args.mw_place_pre_z),
+                ):
+                    env.step(act)
+                    actions.append(np.array(act, dtype=np.float32).copy())
+                    states.append(np.array(env.sim.get_state().flatten(), dtype=np.float64).copy())
+                    if args.video_format != "none":
+                        record_frame(frame_i)
+                        frame_i += 1
+
+                # Idle a bit to let contacts settle (important for contact-based success checks).
+                for _ in range(8):
+                    idle_act = expert._make_action(
+                        arm_cmd=idle_arm,
+                        gripper_cmd=None,
+                        base_cmd=idle_base,
+                        base_mode=-1.0,
+                    )
+                    env.step(idle_act)
+                    actions.append(np.array(idle_act, dtype=np.float32).copy())
+                    states.append(np.array(env.sim.get_state().flatten(), dtype=np.float64).copy())
+                    if args.video_format != "none":
+                        record_frame(frame_i)
+                        frame_i += 1
+
+                try:
+                    store_ok = bool(env._check_store_success())  # noqa: SLF001 (expert script)
+                except Exception:
+                    store_ok = False
+
+                dbg: dict[str, Any] = dict(
+                    attempt=int(attempt_i),
+                    insert_dist=float(ins),
+                    obj_inside_mw_before_pick=bool(obj_inside_mw),
+                    store_ok=bool(store_ok),
+                )
+                try:
+                    dbg["obj_grasped_after_place"] = bool(OU.check_obj_grasped(env, "obj"))
+                except Exception:
+                    dbg["obj_grasped_after_place"] = None
+                try:
+                    dbg["obj_pos"] = _obj_body_pos(env, "obj").tolist()
+                    dbg["plate_pos"] = _obj_body_pos(env, "microwave_plate").tolist()
+                except Exception:
+                    pass
+                try:
+                    dbg["obj_plate_contact"] = bool(
+                        env.check_contact(env.objects["obj"], env.objects["microwave_plate"])
+                    )
+                except Exception:
+                    dbg["obj_plate_contact"] = None
+                try:
+                    dbg["gripper_obj_far"] = bool(OU.gripper_obj_far(env, "obj"))
+                except Exception:
+                    dbg["gripper_obj_far"] = None
+                try:
+                    dbg["obj_inside_mw_after_place"] = bool(
+                        OU.obj_inside_of(env, "obj", env.microwave, partial_check=True)
+                    )
+                except Exception:
+                    dbg["obj_inside_mw_after_place"] = None
+
+                stage_a_attempts.append(dbg)
+                _json_dump(ep_dir / "stage_a_attempts.json", {"attempts": stage_a_attempts})
+
+                if store_ok:
+                    break
 
             # --------------------------
             # Distractors: navigate base to env-provided targets (optional)
@@ -280,6 +476,34 @@ def main() -> None:
             # --------------------------
             # Stage B: layout shift (microwave moves)
             # --------------------------
+            # If the base cannot be actuated, constrain the shift target to keep the post-shift
+            # retrieval reachable (similar to grounding v1 expert).
+            if bool(args.shift_nearest_if_static_base) and (not enable_base_nav or expert.base_cmd_dim < 2):
+                try:
+                    cand = env._find_microwave_shift_counters()  # noqa: SLF001
+                    mw_xy = np.array(getattr(env.microwave, "pos", [0.0, 0.0, 0.0]), dtype=np.float64)[:2]
+
+                    def _dist(name: str) -> float:
+                        fx = env.get_fixture(name, full_name_check=True)
+                        if fx is None:
+                            return float("inf")
+                        pos = np.array(getattr(fx, "pos", [0.0, 0.0, 0.0]), dtype=np.float64)[:2]
+                        return float(np.linalg.norm(pos - mw_xy))
+
+                    reordered = sorted(list(cand), key=_dist)
+                    env._mw_shift_counter_names = reordered  # noqa: SLF001
+                    _json_dump(
+                        ep_dir / "layout_shift_plan.json",
+                        dict(
+                            mode="nearest_first",
+                            reason="static_base_or_base_nav_disabled",
+                            candidates=cand,
+                            reordered=reordered,
+                        ),
+                    )
+                except Exception as e:
+                    _json_dump(ep_dir / "layout_shift_plan.json", {"error": repr(e)})
+
             shift_info = {}
             shift_err = None
             try:
@@ -321,7 +545,19 @@ def main() -> None:
             # --------------------------
             # Stage C: retrieve from microwave, place onto container
             # --------------------------
-            for act in expert.pick_object_from_fixture(fixture=env.microwave, obj_name="obj"):
+            try:
+                env.microwave.open_door(env=env)
+            except Exception:
+                pass
+
+            for act in expert.pick_object_from_fixture(
+                fixture=env.microwave,
+                obj_name="obj",
+                approach_dist=float(args.mw_pick_approach_dist),
+                insert_dist=float(args.mw_pick_insert_dist),
+                lift_z=float(args.mw_pick_lift_z),
+                pre_z=float(args.mw_pick_pre_z),
+            ):
                 env.step(act)
                 actions.append(np.array(act, dtype=np.float32).copy())
                 states.append(np.array(env.sim.get_state().flatten(), dtype=np.float64).copy())
@@ -331,11 +567,30 @@ def main() -> None:
 
             cont_pos = _obj_body_pos(env, "container")
             place_on_container = cont_pos.copy()
-            _json_dump(ep_dir / "stage_c_targets.json", {"container_pos": cont_pos.tolist(), "place_pos": place_on_container.tolist()})
+            try:
+                obj_size = np.array(getattr(env.objects["obj"], "size", [0.04, 0.04, 0.04]), dtype=np.float64)
+                cont_size = np.array(getattr(env.objects["container"], "size", [0.12, 0.12, 0.06]), dtype=np.float64)
+                place_on_container[2] = float(cont_pos[2] + cont_size[2] / 2 + obj_size[2] / 2 + 0.005)
+            except Exception:
+                pass
+            _json_dump(
+                ep_dir / "stage_c_targets.json",
+                {"container_pos": cont_pos.tolist(), "place_pos": place_on_container.tolist()},
+            )
 
             for act in expert.place_object(place_pos=place_on_container):
                 env.step(act)
                 actions.append(np.array(act, dtype=np.float32).copy())
+                states.append(np.array(env.sim.get_state().flatten(), dtype=np.float64).copy())
+                if args.video_format != "none":
+                    record_frame(frame_i)
+                    frame_i += 1
+
+            # Idle a bit to stabilize contacts
+            for _ in range(10):
+                idle_act = expert._make_action(arm_cmd=idle_arm, gripper_cmd=None, base_cmd=idle_base, base_mode=-1.0)
+                env.step(idle_act)
+                actions.append(np.array(idle_act, dtype=np.float32).copy())
                 states.append(np.array(env.sim.get_state().flatten(), dtype=np.float64).copy())
                 if args.video_format != "none":
                     record_frame(frame_i)
