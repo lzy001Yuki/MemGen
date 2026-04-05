@@ -1,489 +1,679 @@
 """
-Script B: Teleoperation Server with Headless Rendering
+Script B: Teleoperation Server (HTTP + MJPEG)
 
-This module implements a FastAPI-based WebSocket server for remote teleoperation:
-- Headless rendering via mujoco.Renderer
-- Real-time RGB/Depth streaming to web client
-- Control command reception (joint velocities or end-effector pose)
-- HDF5 trajectory recording aligned with human demonstrations
+This server is designed to work reliably behind reverse proxies (e.g. VSCode / Jupyter
+web proxy paths like ".../proxy/8000/") by avoiding WebSocket dependencies.
 
-Author: AI Development Engineer
-Date: 2025-01-XX
+It follows the same connection pattern as `benchmark/robocasa/grounding/web/layout_shift_server.py`:
+  - stdlib `http.server` (no FastAPI / Flask)
+  - MJPEG streams for live frames
+  - JSON POST endpoints for teleop / recording control
+
+Endpoints (all are path-prefix friendly when accessed via relative URLs):
+  - GET  /                     -> serves `script_b_teleoperation_client.html`
+  - GET  /api/status            -> status + action space dim
+  - POST /api/step              -> step env with action command
+  - POST /api/reset             -> env.reset()
+  - POST /api/start_recording   -> start recording
+  - POST /api/stop_recording    -> stop & save HDF5
+  - GET  /rgb.mjpg              -> MJPEG stream (RGB)
+  - GET  /depth.mjpg            -> MJPEG stream (Depth visualized)
+
+Typical usage:
+  export MUJOCO_GL=egl
+  python benchmark/robocasa/grounding_v1/script_b_teleoperation_server.py --host 0.0.0.0 --port 8000
 """
 
-import argparse
-import asyncio
-import base64
-import json
-import numpy as np
-from pathlib import Path
-from typing import Dict, List, Optional, Set
-from datetime import datetime
-from io import BytesIO
+from __future__ import annotations
 
-import mujoco
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
-import uvicorn
+import os
+
+# --- Headless rendering / GL bootstrap -------------------------------------
+# This server is meant for headless use. Robosuite/robocasa's offscreen renderer
+# can use PyOpenGL, and on headless systems PyOpenGL may pick a GLX platform by
+# default (no EGL), crashing with:
+#   AttributeError: 'NoneType' object has no attribute 'eglQueryString'
+#
+# Make the backend explicit but still user-overridable.
+os.environ.setdefault("MUJOCO_GL", "egl")
+_mujoco_gl = (os.environ.get("MUJOCO_GL") or "").strip().lower()
+if _mujoco_gl in ("egl", "osmesa"):
+    os.environ.setdefault("PYOPENGL_PLATFORM", _mujoco_gl)
+else:
+    # If MUJOCO_GL is something else (or empty), EGL is the safest default for headless.
+    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+
+# For headless EGL, surfaceless is the most common choice; users can override.
+if (os.environ.get("PYOPENGL_PLATFORM") or "").strip().lower() == "egl":
+    os.environ.setdefault("EGL_PLATFORM", "surfaceless")
+
+import argparse
+import json
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+import numpy as np
 from PIL import Image
 
 from long_horizon_env import LongHorizonTask
 from script_a_automated_recording import RobomimicHDF5Writer, TrajectoryBuffer
 
 
-class HeadlessRenderer:
+def _json_bytes(payload: dict[str, Any]) -> bytes:
+    return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False).encode("utf-8")
+
+
+def _encode_jpeg(image: np.ndarray, *, quality: int = 85) -> bytes:
     """
-    Headless rendering using robosuite's camera system.
+    Encode an image array as JPEG bytes.
+
+    Supports:
+      - RGB uint8 HxWx3
+      - Depth float32/float64 HxW (normalized to uint8)
     """
-
-    def __init__(self, env, camera_names: List[str] = None):
-        """
-        Initialize headless renderer.
-
-        Args:
-            env: Robosuite/robocasa environment
-            camera_names: List of camera names to use
-        """
-        self.env = env
-        self.camera_names = camera_names or ["robot0_agentview_center", "robot0_eye_in_hand"]
-        self.width = 640
-        self.height = 480
-
-        # Set environment to use camera observations
-        if hasattr(env, 'camera_names'):
-            env.camera_names = self.camera_names
-            env.camera_heights = [self.height] * len(self.camera_names)
-            env.camera_widths = [self.width] * len(self.camera_names)
-
-    def render_rgb(self, camera_name: str = None) -> np.ndarray:
-        """
-        Render RGB image from specified camera.
-
-        Args:
-            camera_name: Camera name to render from (uses first camera if None)
-
-        Returns:
-            RGB image array (H, W, 3) uint8
-        """
-        if camera_name is None:
-            camera_name = self.camera_names[0]
-
-        # Use robosuite's sim.render
-        rgb = self.env.sim.render(
-            camera_name=camera_name,
-            height=self.height,
-            width=self.width,
-            depth=False
-        )
-
-        # Flip image (robosuite renders upside down)
-        rgb = np.flipud(rgb)
-        return rgb
-
-    def render_depth(self, camera_name: str = None) -> np.ndarray:
-        """
-        Render depth image from specified camera.
-
-        Args:
-            camera_name: Camera name to render from (uses first camera if None)
-
-        Returns:
-            Depth image array (H, W) float32
-        """
-        if camera_name is None:
-            camera_name = self.camera_names[0]
-
-        # Render with depth
-        _, depth = self.env.sim.render(
-            camera_name=camera_name,
-            height=self.height,
-            width=self.width,
-            depth=True
-        )
-
-        # Flip depth (robosuite renders upside down)
-        depth = np.flipud(depth)
-        return depth
-
-    def encode_image_base64(self, image: np.ndarray) -> str:
-        """
-        Encode image as base64 string for web transmission.
-
-        Args:
-            image: Image array (RGB or depth)
-
-        Returns:
-            Base64-encoded JPEG string
-        """
-        # Convert to PIL Image
-        if image.dtype == np.float32:
-            # Depth image - normalize to 0-255
-            image = ((image - image.min()) / (image.max() - image.min() + 1e-8) * 255).astype(np.uint8)
-
+    if image.ndim == 2:
+        # Depth or grayscale
+        if image.dtype != np.uint8:
+            img_min = float(np.min(image))
+            img_max = float(np.max(image))
+            denom = (img_max - img_min) if (img_max - img_min) > 1e-8 else 1.0
+            image = ((image - img_min) / denom * 255.0).astype(np.uint8)
+        pil_img = Image.fromarray(image, mode="L")
+    else:
+        if image.dtype != np.uint8:
+            image = np.clip(image, 0, 255).astype(np.uint8)
         pil_img = Image.fromarray(image)
 
-        # Encode as JPEG
-        buffer = BytesIO()
-        pil_img.save(buffer, format="JPEG", quality=85)
-        buffer.seek(0)
-
-        # Base64 encode
-        img_str = base64.b64encode(buffer.read()).decode("utf-8")
-        return f"data:image/jpeg;base64,{img_str}"
+    buf = BytesIO()
+    pil_img.save(buf, format="JPEG", quality=int(quality), optimize=True)
+    return buf.getvalue()
 
 
-class TeleoperationSession:
+class HeadlessRenderer:
     """
-    Manages a single teleoperation session including:
-    - Environment state
-    - Recording state
-    - Control command buffering
+    Headless rendering using robosuite's sim.render.
     """
 
-    def __init__(
-        self,
-        env: LongHorizonTask,
-        renderer: HeadlessRenderer,
-        session_id: str
-    ):
-        """
-        Initialize teleoperation session.
-
-        Args:
-            env: Task environment
-            renderer: Headless renderer
-            session_id: Unique session identifier
-        """
+    def __init__(self, env, camera_names: list[str] | None = None, *, width: int = 640, height: int = 480):
         self.env = env
-        self.renderer = renderer
-        self.session_id = session_id
+        self.camera_names = camera_names or ["robot0_agentview_center", "robot0_eye_in_hand"]
+        self.width = int(width)
+        self.height = int(height)
 
-        # Recording state
-        self.is_recording = False
+        # Best-effort: configure env to emit camera obs if supported.
+        if hasattr(env, "camera_names"):
+            try:
+                env.camera_names = self.camera_names
+                env.camera_heights = [self.height] * len(self.camera_names)
+                env.camera_widths = [self.width] * len(self.camera_names)
+            except Exception:
+                pass
+
+    def _clear_offscreen_render_context(self) -> None:
+        """
+        Clear RoboSuite's cached offscreen render context.
+
+        When EGL context creation fails (or fails half-way), RoboSuite can leave
+        `sim._render_context_offscreen` in a broken state which then causes
+        subsequent renders to fail with errors like:
+          - AttributeError: 'MjRenderContextOffscreen' object has no attribute 'con'
+        """
+        sim = getattr(self.env, "sim", None)
+        if sim is None:
+            return
+        if not hasattr(sim, "_render_context_offscreen"):
+            return
+        try:
+            ctx = getattr(sim, "_render_context_offscreen", None)
+            if ctx is not None and hasattr(ctx, "free"):
+                try:
+                    ctx.free()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            setattr(sim, "_render_context_offscreen", None)
+        except Exception:
+            pass
+
+    def _normalize_rgb_uint8(self, rgb: np.ndarray) -> np.ndarray:
+        if rgb.dtype == np.uint8:
+            return rgb
+        rgb_f = np.array(rgb, dtype=np.float32, copy=False)
+        mx = float(np.max(rgb_f)) if rgb_f.size else 0.0
+        # Some backends return floats in [0, 1]
+        if mx <= 1.5:
+            rgb_f = np.clip(rgb_f, 0.0, 1.0) * 255.0
+        else:
+            rgb_f = np.clip(rgb_f, 0.0, 255.0)
+        return rgb_f.astype(np.uint8)
+
+    def _pick_camera(self, preferred: str | None) -> str:
+        cam = preferred or self.camera_names[0]
+        try:
+            model = getattr(getattr(self.env, "sim", None), "model", None)
+            if model is None:
+                return cam
+            # Most bindings expose camera_name2id; use it as validation.
+            name2id = getattr(model, "camera_name2id", None)
+            if callable(name2id):
+                try:
+                    name2id(cam)
+                    return cam
+                except Exception:
+                    pass
+            # Fallback: check camera_names list if present.
+            names = getattr(model, "camera_names", None)
+            if names:
+                decoded = []
+                for n in names:
+                    if isinstance(n, bytes):
+                        decoded.append(n.decode("utf-8", errors="ignore"))
+                    else:
+                        decoded.append(str(n))
+                if cam in decoded:
+                    return cam
+                if decoded:
+                    return decoded[0]
+        except Exception:
+            pass
+        return cam
+
+    def render_rgb(self, camera_name: str | None = None) -> np.ndarray:
+        cam = self._pick_camera(camera_name)
+        # Retry once if RoboSuite's cached context is broken.
+        for attempt in range(2):
+            try:
+                # Use the same call style as layout_shift_server.py for compatibility.
+                rgb = self.env.sim.render(height=self.height, width=self.width, camera_name=cam)[::-1]
+                return self._normalize_rgb_uint8(rgb)
+            except AttributeError as e:
+                msg = repr(e)
+                if attempt == 0 and "MjRenderContextOffscreen" in msg and "con" in msg:
+                    self._clear_offscreen_render_context()
+                    continue
+                raise
+            except Exception as e:
+                # Common MuJoCo failure in headless / misconfigured GL backends.
+                if attempt == 0 and "Default framebuffer is not complete" in repr(e):
+                    self._clear_offscreen_render_context()
+                    continue
+                raise
+
+    def render_depth(self, camera_name: str | None = None) -> np.ndarray:
+        cam = self._pick_camera(camera_name)
+        for attempt in range(2):
+            try:
+                out = self.env.sim.render(height=self.height, width=self.width, camera_name=cam, depth=True)
+                if isinstance(out, tuple) and len(out) == 2:
+                    _, depth = out
+                else:
+                    # Some versions may return only depth when depth=True (rare).
+                    depth = out
+                depth = np.flipud(depth)
+                return np.array(depth, dtype=np.float32, copy=False)
+            except AttributeError as e:
+                msg = repr(e)
+                if attempt == 0 and "MjRenderContextOffscreen" in msg and "con" in msg:
+                    self._clear_offscreen_render_context()
+                    continue
+                raise
+            except Exception as e:
+                if attempt == 0 and "Default framebuffer is not complete" in repr(e):
+                    self._clear_offscreen_render_context()
+                    continue
+                raise
+
+
+@dataclass
+class ServerConfig:
+    object_type: str
+    container_type: str
+    num_intermediate: int
+    host: str
+    port: int
+    stream_fps: float = 10.0
+    jpeg_quality: int = 85
+    width: int = 640
+    height: int = 480
+    out_dir: Path = Path("./data/teleoperation")
+
+
+class TeleoperationAppState:
+    def __init__(self, cfg: ServerConfig):
+        self.cfg = cfg
+        self.lock = threading.Lock()
+
+        self.last_error: str | None = None
+        self.last_saved: str | None = None
+        self.step_i: int = 0
+        self.last_reward: float | None = None
+        self.last_info: dict[str, Any] = {}
+
+        self.is_recording: bool = False
         self.trajectory = TrajectoryBuffer()
-        self.current_obs = None
 
-        # Control state
-        self.last_action = np.zeros(env.action_space.shape[0])
+        self.env = LongHorizonTask(
+            object_type=self.cfg.object_type,
+            container_type=self.cfg.container_type,
+            num_intermediate=self.cfg.num_intermediate,
+            # Match layout_shift_server.py: don't rely on camera observations; we render
+            # manually for MJPEG streaming.
+            use_camera_obs=False,
+            has_renderer=False,
+            has_offscreen_renderer=True,
+            render_gpu_device_id=-1,
+            camera_heights=int(self.cfg.height),
+            camera_widths=int(self.cfg.width),
+        )
+        reset_out = self.env.reset()
+        if isinstance(reset_out, tuple) and len(reset_out) == 2:
+            obs, info = reset_out
+        else:
+            obs, info = reset_out, {}
+        self.current_obs = obs
+        self.last_info = dict(info) if isinstance(info, dict) else {}
 
-    def start_recording(self):
-        """Start trajectory recording"""
-        self.is_recording = True
-        self.trajectory.reset()
-        print(f"[{self.session_id}] Recording started")
+        self.renderer = HeadlessRenderer(self.env, width=self.cfg.width, height=self.cfg.height)
+        # robosuite / robocasa typically exposes action bounds via `action_spec`
+        # (low, high). Gymnasium exposes `action_space`.
+        if hasattr(self.env, "action_spec"):
+            low, high = self.env.action_spec  # type: ignore[attr-defined]
+            self.action_low = np.array(low, dtype=np.float32).reshape(-1)
+            self.action_high = np.array(high, dtype=np.float32).reshape(-1)
+        elif hasattr(self.env, "action_space"):
+            space = self.env.action_space  # type: ignore[attr-defined]
+            self.action_low = np.array(space.low, dtype=np.float32).reshape(-1)
+            self.action_high = np.array(space.high, dtype=np.float32).reshape(-1)
+        else:
+            raise AttributeError("env has neither `action_spec` nor `action_space`")
 
-    def stop_recording(self) -> TrajectoryBuffer:
-        """
-        Stop trajectory recording.
+        self.action_dim = int(self.action_low.shape[0])
+        self.last_action = np.zeros(self.action_dim, dtype=np.float32)
 
-        Returns:
-            Recorded trajectory buffer
-        """
-        self.is_recording = False
-        print(f"[{self.session_id}] Recording stopped ({self.trajectory.get_length()} steps)")
-        return self.trajectory
+        self.cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
-    def process_control_command(self, command: Dict) -> np.ndarray:
-        """
-        Process control command from web client.
+    def close(self) -> None:
+        try:
+            self.env.close()
+        except Exception:
+            pass
 
-        Args:
-            command: Control command dictionary
-                - type: "velocity" or "position"
-                - values: list of floats
+    def status(self) -> dict[str, Any]:
+        phase = None
+        try:
+            phase = self.last_info.get("current_phase", None)
+        except Exception:
+            phase = None
 
-        Returns:
-            Action array
-        """
-        cmd_type = command.get("type", "velocity")
-        values = command.get("values", [0.0] * self.env.action_space.shape[0])
-
-        # Convert to numpy array
-        action = np.array(values, dtype=np.float32)
-
-        # Clip to action space bounds
-        action = np.clip(
-            action,
-            self.env.action_space.low,
-            self.env.action_space.high
+        return dict(
+            ok=(self.last_error is None),
+            error=self.last_error,
+            action_space_shape=int(self.action_dim),
+            recording=bool(self.is_recording),
+            saved_path=self.last_saved,
+            step_i=int(self.step_i),
+            last_reward=(float(self.last_reward) if self.last_reward is not None else None),
+            current_phase=phase,
+            env_config=dict(
+                object_type=self.cfg.object_type,
+                container_type=self.cfg.container_type,
+                num_intermediate=int(self.cfg.num_intermediate),
+            ),
         )
 
-        self.last_action = action
-        return action
+    def reset(self) -> dict[str, Any]:
+        with self.lock:
+            self.last_error = None
+            self.last_saved = None
+            reset_out = self.env.reset()
+            if isinstance(reset_out, tuple) and len(reset_out) == 2:
+                obs, info = reset_out
+            else:
+                obs, info = reset_out, {}
+            self.current_obs = obs
+            self.last_info = dict(info) if isinstance(info, dict) else {}
+            self.step_i = 0
+            self.last_reward = None
+            self.last_action = np.zeros(self.action_dim, dtype=np.float32)
+            return self.status()
 
-    def step(self, action: np.ndarray) -> Dict:
-        """
-        Execute one environment step.
+    def start_recording(self) -> dict[str, Any]:
+        with self.lock:
+            self.last_error = None
+            self.last_saved = None
+            if self.is_recording:
+                self.last_error = "already recording"
+                return self.status()
+            self.is_recording = True
+            self.trajectory.reset()
+            return self.status()
 
-        Args:
-            action: Action array
+    def stop_recording(self) -> dict[str, Any]:
+        with self.lock:
+            self.last_error = None
+            if not self.is_recording:
+                self.last_error = "not recording"
+                return self.status()
 
-        Returns:
-            Step result dictionary with observation, reward, done, info
-        """
-        obs, reward, terminated, truncated, info = self.env.step(action)
+            self.is_recording = False
+            trajectory = self.trajectory
+            self.trajectory = TrajectoryBuffer()
 
-        # Record if active
-        if self.is_recording and self.current_obs is not None:
-            self.trajectory.add_transition(
-                self.current_obs,
-                action,
-                reward,
-                terminated or truncated,
-                info
-            )
+            # Save trajectory (best-effort even if empty; return error if empty)
+            if trajectory.is_empty():
+                self.last_error = "trajectory is empty"
+                return self.status()
 
-        self.current_obs = obs
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = str(self.cfg.out_dir / f"demo_teleop_{timestamp}.hdf5")
 
-        return {
-            "observation": obs.tolist() if isinstance(obs, np.ndarray) else obs,
-            "reward": float(reward),
-            "terminated": bool(terminated),
-            "truncated": bool(truncated),
-            "info": {k: v for k, v in info.items() if isinstance(v, (int, float, str, bool))},
-        }
-
-    def get_visual_frame(self) -> Dict[str, str]:
-        """
-        Get current visual frame (RGB + Depth).
-
-        Returns:
-            Dictionary with base64-encoded images
-        """
-        # Render RGB
-        rgb = self.renderer.render_rgb()
-        rgb_b64 = self.renderer.encode_image_base64(rgb)
-
-        # Render Depth
-        depth = self.renderer.render_depth()
-        depth_b64 = self.renderer.encode_image_base64(depth)
-
-        return {
-            "rgb": rgb_b64,
-            "depth": depth_b64,
-        }
-
-
-# FastAPI application
-app = FastAPI(title="Robocasa Teleoperation Server")
-
-# Global state
-active_sessions: Dict[str, TeleoperationSession] = {}
-env_config = {
-    "object_type": "apple",
-    "container_type": "microwave",
-    "num_intermediate": 2,
-}
-
-
-@app.get("/")
-async def get_client():
-    """Serve the web client HTML"""
-    html_path = Path(__file__).parent / "script_b_teleoperation_client.html"
-
-    if html_path.exists():
-        return HTMLResponse(content=html_path.read_text())
-    else:
-        return HTMLResponse(content="""
-        <html>
-            <body>
-                <h1>Robocasa Teleoperation Client</h1>
-                <p>Client HTML not found. Please create script_b_teleoperation_client.html</p>
-            </body>
-        </html>
-        """)
-
-
-@app.websocket("/ws/{session_id}")
-async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    """
-    WebSocket endpoint for teleoperation session.
-
-    Args:
-        websocket: WebSocket connection
-        session_id: Unique session identifier
-    """
-    await websocket.accept()
-    print(f"Client connected: {session_id}")
-
-    try:
-        # Create environment and session
-        print(f"[{session_id}] Creating environment...")
-        env = LongHorizonTask(**env_config)
-
-        print(f"[{session_id}] Resetting environment...")
-        obs, info = env.reset()
-
-        print(f"[{session_id}] Creating renderer...")
-        renderer = HeadlessRenderer(env=env)
-
-        session = TeleoperationSession(env, renderer, session_id)
-        session.current_obs = obs
-        active_sessions[session_id] = session
-
-        # Send initial state
-        await websocket.send_json({
-            "type": "init",
-            "action_space_shape": env.action_space.shape[0],
-            "episode_meta": env.get_ep_meta(),
-        })
-
-        print(f"[{session_id}] Initialization complete")
-
-    except Exception as e:
-        print(f"[{session_id}] Initialization failed: {e}")
-        import traceback
-        traceback.print_exc()
-
-        await websocket.send_json({
-            "type": "error",
-            "message": f"Environment initialization failed: {str(e)}"
-        })
-        await websocket.close()
-        return
-
-    try:
-        # Main loop
-        while True:
-            # Receive client message
             try:
-                message = await asyncio.wait_for(
-                    websocket.receive_json(),
-                    timeout=0.05  # 50ms timeout for responsive rendering
-                )
-            except asyncio.TimeoutError:
-                message = None
+                writer = RobomimicHDF5Writer(output_path, self.env.get_ep_meta())
+                writer.add_trajectory(trajectory)
+                writer.write()
+                self.last_saved = output_path
+            except Exception as e:
+                self.last_error = f"save failed: {e!r}"
 
-            # Process commands
-            if message:
-                msg_type = message.get("type")
+            return self.status()
 
-                if msg_type == "control":
-                    # Execute control command
-                    action = session.process_control_command(message.get("command", {}))
-                    step_result = session.step(action)
+    def step(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """
+        Step the env once.
 
-                    # Send step result
-                    await websocket.send_json({
-                        "type": "step_result",
-                        "data": step_result,
-                    })
+        Expected payloads (client is flexible):
+          - {"command": {"type": "velocity", "values": [...]}}
+          - {"values": [...]}  (shorthand)
+        """
+        with self.lock:
+            self.last_error = None
+            self.last_saved = None
 
-                elif msg_type == "start_recording":
-                    session.start_recording()
-                    await websocket.send_json({
-                        "type": "recording_status",
-                        "recording": True,
-                    })
+            try:
+                command = payload.get("command", payload) if isinstance(payload, dict) else {}
+                values = command.get("values", None) if isinstance(command, dict) else None
+                if values is None:
+                    values = [0.0] * self.action_dim
+                action = np.array(values, dtype=np.float32).reshape(-1)
+                if action.size < self.action_dim:
+                    action = np.pad(action, (0, self.action_dim - action.size))
+                action = action[: self.action_dim]
+                action = np.clip(action, self.action_low, self.action_high)
+            except Exception as e:
+                self.last_error = f"bad action payload: {e!r}"
+                return self.status()
 
-                elif msg_type == "stop_recording":
-                    trajectory = session.stop_recording()
+            try:
+                step_out = self.env.step(action)
+            except Exception as e:
+                self.last_error = f"env.step failed: {e!r}"
+                return self.status()
 
-                    # Save trajectory
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    output_path = f"./data/teleoperation/demo_{session_id}_{timestamp}.hdf5"
+            # robosuite API: (obs, reward, done, info)
+            # gymnasium API: (obs, reward, terminated, truncated, info)
+            obs = None
+            reward = 0.0
+            terminated = False
+            truncated = False
+            info: dict[str, Any] = {}
+            try:
+                if isinstance(step_out, tuple) and len(step_out) == 5:
+                    obs, reward, terminated, truncated, info = step_out  # type: ignore[misc]
+                elif isinstance(step_out, tuple) and len(step_out) == 4:
+                    obs, reward, done, info = step_out  # type: ignore[misc]
+                    terminated = bool(done)
+                    truncated = False
+                else:
+                    raise ValueError(f"unexpected env.step return: {type(step_out)} / len={len(step_out) if isinstance(step_out, tuple) else 'n/a'}")
+            except Exception as e:
+                self.last_error = f"bad env.step return: {e!r}"
+                return self.status()
 
-                    writer = RobomimicHDF5Writer(output_path, env.get_ep_meta())
-                    writer.add_trajectory(trajectory)
-                    writer.write()
+            done = bool(terminated) or bool(truncated)
 
-                    await websocket.send_json({
-                        "type": "recording_status",
-                        "recording": False,
-                        "saved_path": output_path,
-                    })
+            # Record if active (record obs BEFORE the transition, same as original script_b)
+            if self.is_recording and self.current_obs is not None:
+                try:
+                    self.trajectory.add_transition(self.current_obs, action, float(reward), done, info if isinstance(info, dict) else {})
+                except Exception as e:
+                    self.last_error = f"recording failed: {e!r}"
 
-                elif msg_type == "reset":
-                    obs, info = env.reset()
-                    session.current_obs = obs
-                    await websocket.send_json({
-                        "type": "reset_complete",
-                    })
+            self.current_obs = obs
+            self.last_action = action
+            self.last_reward = float(reward)
+            self.last_info = dict(info) if isinstance(info, dict) else {}
+            self.step_i += 1
 
-            # Send visual frame (20 FPS)
-            await asyncio.sleep(0.05)
-            frame = session.get_visual_frame()
-            await websocket.send_json({
-                "type": "frame",
-                "data": frame,
-            })
+            st = self.status()
+            # Small step result blob for UI; keep it JSON-friendly.
+            st["step_result"] = dict(
+                reward=float(reward),
+                terminated=bool(terminated),
+                truncated=bool(truncated),
+                info={k: v for k, v in (info or {}).items() if isinstance(v, (int, float, str, bool))} if isinstance(info, dict) else {},
+            )
+            return st
 
-    except WebSocketDisconnect:
-        print(f"Client disconnected: {session_id}")
-    finally:
-        # Cleanup
-        env.close()
-        if session_id in active_sessions:
-            del active_sessions[session_id]
+    def snapshot_rgb_jpeg(self, *, quality: int | None = None) -> bytes:
+        with self.lock:
+            rgb = self.renderer.render_rgb()
+        return _encode_jpeg(rgb, quality=(quality if quality is not None else self.cfg.jpeg_quality))
+
+    def snapshot_depth_jpeg(self, *, quality: int | None = None) -> bytes:
+        with self.lock:
+            depth = self.renderer.render_depth()
+        return _encode_jpeg(depth, quality=(quality if quality is not None else self.cfg.jpeg_quality))
 
 
-def main():
-    """
-    Main entry point for teleoperation server.
-    """
-    parser = argparse.ArgumentParser(
-        description="Teleoperation Server for Long-Horizon Task"
-    )
-    parser.add_argument(
-        "--object_type",
-        type=str,
-        default="apple",
-        help="Object type to manipulate"
-    )
-    parser.add_argument(
-        "--container_type",
-        type=str,
-        default="microwave",
-        help="Container type"
-    )
-    parser.add_argument(
-        "--num_intermediate",
-        type=int,
-        default=2,
-        choices=[2, 3],
-        help="Number of intermediate tasks"
-    )
-    parser.add_argument(
-        "--host",
-        type=str,
-        default="0.0.0.0",
-        help="Server host"
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=8000,
-        help="Server port"
-    )
+class RequestHandler(BaseHTTPRequestHandler):
+    server: "TeleoperationHTTPServer"  # type: ignore[assignment]
 
+    def log_message(self, fmt: str, *args: Any) -> None:  # noqa: D401
+        # Keep logs readable in remote tmux output.
+        return super().log_message(fmt, *args)
+
+    def _send_bytes(self, status: int, content_type: str, body: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+        self._send_bytes(status, "application/json; charset=utf-8", _json_bytes(payload))
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/":
+            html_path = Path(__file__).parent / "script_b_teleoperation_client.html"
+            body = html_path.read_bytes() if html_path.exists() else b"missing client html"
+            return self._send_bytes(HTTPStatus.OK, "text/html; charset=utf-8", body)
+
+        if path == "/api/status":
+            return self._send_json(HTTPStatus.OK, self.server.app.status())
+
+        if path == "/snapshot_rgb.jpg":
+            try:
+                jpg = self.server.app.snapshot_rgb_jpeg()
+                return self._send_bytes(HTTPStatus.OK, "image/jpeg", jpg)
+            except Exception as e:
+                return self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": repr(e)})
+
+        if path == "/snapshot_depth.jpg":
+            try:
+                jpg = self.server.app.snapshot_depth_jpeg()
+                return self._send_bytes(HTTPStatus.OK, "image/jpeg", jpg)
+            except Exception as e:
+                return self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": repr(e)})
+
+        if path == "/rgb.mjpg":
+            return self._handle_mjpeg_stream(parsed, kind="rgb")
+
+        if path == "/depth.mjpg":
+            return self._handle_mjpeg_stream(parsed, kind="depth")
+
+        return self._send_json(HTTPStatus.NOT_FOUND, {"error": f"unknown path: {path}"})
+
+    def _handle_mjpeg_stream(self, parsed, *, kind: str) -> None:
+        qs = parse_qs(parsed.query or "")
+        try:
+            fps = float(qs.get("fps", [str(self.server.app.cfg.stream_fps)])[0])
+        except Exception:
+            fps = float(self.server.app.cfg.stream_fps)
+        fps = max(0.1, min(60.0, fps))
+        interval = 1.0 / fps
+
+        try:
+            quality = int(qs.get("quality", [str(self.server.app.cfg.jpeg_quality)])[0])
+        except Exception:
+            quality = int(self.server.app.cfg.jpeg_quality)
+        quality = max(10, min(95, quality))
+
+        boundary = "frame"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Age", "0")
+        self.send_header("Cache-Control", "no-cache, private")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={boundary}")
+        self.end_headers()
+
+        try:
+            while True:
+                start = time.time()
+                try:
+                    if kind == "rgb":
+                        jpeg = self.server.app.snapshot_rgb_jpeg(quality=quality)
+                    else:
+                        jpeg = self.server.app.snapshot_depth_jpeg(quality=quality)
+                except Exception as e:
+                    with self.server.app.lock:
+                        self.server.app.last_error = f"mjpeg({kind}) render failed: {e!r}"
+                    return
+
+                self.wfile.write(f"--{boundary}\r\n".encode("utf-8"))
+                self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                self.wfile.write(f"Content-Length: {len(jpeg)}\r\n\r\n".encode("utf-8"))
+                self.wfile.write(jpeg)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+
+                elapsed = time.time() - start
+                sleep_t = interval - elapsed
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
+        except BrokenPipeError:
+            return
+        except ConnectionResetError:
+            return
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except Exception:
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b""
+        payload: dict[str, Any] = {}
+        if raw:
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+                if not isinstance(payload, dict):
+                    payload = {}
+            except Exception:
+                payload = {}
+
+        if path == "/api/reset":
+            return self._send_json(HTTPStatus.OK, self.server.app.reset())
+        if path == "/api/start_recording":
+            return self._send_json(HTTPStatus.OK, self.server.app.start_recording())
+        if path == "/api/stop_recording":
+            return self._send_json(HTTPStatus.OK, self.server.app.stop_recording())
+        if path == "/api/step":
+            return self._send_json(HTTPStatus.OK, self.server.app.step(payload))
+
+        return self._send_json(HTTPStatus.NOT_FOUND, {"error": f"unknown path: {path}"})
+
+
+class TeleoperationHTTPServer(ThreadingHTTPServer):
+    def __init__(self, server_address, app: TeleoperationAppState):
+        super().__init__(server_address, RequestHandler)
+        self.app = app
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Teleoperation Server (HTTP + MJPEG)")
+    parser.add_argument("--object_type", type=str, default="apple", help="Object type to manipulate")
+    parser.add_argument("--container_type", type=str, default="microwave", help="Container type")
+    parser.add_argument("--num_intermediate", type=int, default=2, choices=[2, 3], help="Number of intermediate tasks")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
+    parser.add_argument("--port", type=int, default=8000, help="Server port")
+    parser.add_argument("--stream_fps", type=float, default=10.0, help="MJPEG stream FPS (default 10)")
+    parser.add_argument("--jpeg_quality", type=int, default=85, help="JPEG quality (10-95)")
+    parser.add_argument("--width", type=int, default=640, help="Render width")
+    parser.add_argument("--height", type=int, default=480, help="Render height")
+    parser.add_argument("--out_dir", type=str, default="./data/teleoperation", help="Output directory for demos")
     args = parser.parse_args()
 
-    # Update global config
-    global env_config
-    env_config = {
-        "object_type": args.object_type,
-        "container_type": args.container_type,
-        "num_intermediate": args.num_intermediate,
-    }
-
-    print("=" * 60)
-    print("Teleoperation Server - Script B")
-    print("=" * 60)
-    print(f"Server URL: http://{args.host}:{args.port}")
-    print(f"WebSocket: ws://{args.host}:{args.port}/ws/{{session_id}}")
-    print("=" * 60)
-
-    # Create data directory
-    Path("./data/teleoperation").mkdir(parents=True, exist_ok=True)
-
-    # Run server
-    uvicorn.run(
-        app,
+    cfg = ServerConfig(
+        object_type=args.object_type,
+        container_type=args.container_type,
+        num_intermediate=int(args.num_intermediate),
         host=args.host,
-        port=args.port,
-        log_level="info"
+        port=int(args.port),
+        stream_fps=float(args.stream_fps),
+        jpeg_quality=int(args.jpeg_quality),
+        width=int(args.width),
+        height=int(args.height),
+        out_dir=Path(args.out_dir),
     )
+
+    print("=" * 60)
+    print("Teleoperation Server - Script B (HTTP + MJPEG)")
+    print("=" * 60)
+    print(f"HTTP URL : http://{cfg.host}:{cfg.port}/")
+    print(f"RGB MJPG : http://{cfg.host}:{cfg.port}/rgb.mjpg")
+    print(f"Depth MJPG: http://{cfg.host}:{cfg.port}/depth.mjpg")
+    print("=" * 60)
+
+    try:
+        app = TeleoperationAppState(cfg)
+    except Exception:
+        print("\n[Teleop] Environment init failed (offscreen render backend).")
+        print("This is usually a headless OpenGL/EGL setup issue.")
+        print("Recommended (EGL):")
+        print("  export MUJOCO_GL=egl")
+        print("  export PYOPENGL_PLATFORM=egl")
+        print("  export EGL_PLATFORM=surfaceless")
+        print("Fallback (CPU / OSMesa, requires OSMesa libs):")
+        print("  export MUJOCO_GL=osmesa")
+        print("  export PYOPENGL_PLATFORM=osmesa\n")
+        raise
+    server = TeleoperationHTTPServer((cfg.host, cfg.port), app)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            server.server_close()
+        except Exception:
+            pass
+        app.close()
 
 
 if __name__ == "__main__":

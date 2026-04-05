@@ -390,8 +390,22 @@ class LongHorizonTask(Kitchen):
         Returns:
             observation, reward, terminated, truncated, info
         """
-        # Execute base environment step
-        obs, reward, terminated, truncated, info = super().step(action)
+        # Execute base environment step.
+        #
+        # robosuite-style envs commonly return: (obs, reward, done, info)
+        # gymnasium-style envs return:       (obs, reward, terminated, truncated, info)
+        base_out = super().step(action)
+        if isinstance(base_out, tuple) and len(base_out) == 5:
+            obs, reward, terminated, truncated, info = base_out
+        elif isinstance(base_out, tuple) and len(base_out) == 4:
+            obs, reward, done, info = base_out
+            terminated = bool(done)
+            truncated = False
+        else:
+            raise ValueError(
+                f"Unexpected Kitchen.step return: type={type(base_out)} "
+                f"len={len(base_out) if isinstance(base_out, tuple) else 'n/a'}"
+            )
 
         # Phase state machine logic
         if self.current_phase == TaskPhase.PHASE_1_PLACE:

@@ -390,133 +390,19 @@
     </div>
 
     <script>
-        // WebSocket connection
-        let ws = null;
+        // Dependency-light HTTP teleop client (no WebSocket).
+        // Connection pattern matches `grounding/web/layout_shift_server.py`:
+        //   - MJPEG for video streams
+        //   - fetch() JSON endpoints for control / recording
+
+        let isConnected = false;
+        let serverError = null;
         let isRecording = false;
-        let actionDim = 7; // Default 7-DOF
+        let actionDim = 7; // Default 7-DOF (updated by /api/status)
         let currentAction = new Array(actionDim).fill(0.0);
+        let slidersInitialized = false;
 
-        // Session ID (can be customized)
-        const sessionId = 'user_' + Date.now();
-
-        // Initialize WebSocket
-        function initWebSocket() {
-            // Determine WebSocket protocol based on page protocol
-            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-
-            // Build WS URL relative to the current page URL so we automatically keep
-            // any reverse-proxy prefixes (e.g. ".../proxy/8000/") and auth query
-            // (e.g. "?token=...").
-            const wsUrlObj = new URL(`ws/${sessionId}`, window.location.href);
-            wsUrlObj.protocol = wsProtocol;
-            const wsUrl = wsUrlObj.toString();
-
-            console.log('Connecting to:', wsUrl);
-            ws = new WebSocket(wsUrl);
-
-            ws.onopen = () => {
-                console.log('WebSocket connected');
-                updateStatus('connected', 'Connected');
-            };
-
-            ws.onmessage = async (event) => {
-                let textData = null;
-                let debugMeta = null;
-
-                try {
-                    if (typeof event.data === 'string') {
-                        textData = event.data;
-                        debugMeta = { kind: 'string', length: event.data.length };
-                    } else if (event.data instanceof Blob) {
-                        debugMeta = { kind: 'blob', size: event.data.size, type: event.data.type };
-                        // Read as ArrayBuffer first so we can log hex if needed.
-                        const buf = await event.data.arrayBuffer();
-                        const bytes = new Uint8Array(buf);
-                        const hexPreview = Array.from(bytes.slice(0, 32))
-                            .map((b) => b.toString(16).padStart(2, '0'))
-                            .join(' ');
-                        debugMeta.hexPreview = hexPreview;
-                        textData = new TextDecoder('utf-8').decode(buf);
-                    } else if (event.data instanceof ArrayBuffer) {
-                        debugMeta = { kind: 'arraybuffer', byteLength: event.data.byteLength };
-                        textData = new TextDecoder('utf-8').decode(event.data);
-                    } else {
-                        textData = String(event.data);
-                        debugMeta = { kind: 'unknown', type: typeof event.data };
-                    }
-
-                    // Some reverse proxies may send non-JSON keepalive frames. Ignore those
-                    // but keep a useful debug print once.
-                    const trimmed = (textData || '').trimStart();
-                    if (!(trimmed.startsWith('{') || trimmed.startsWith('['))) {
-                        throw new Error('Non-JSON WebSocket frame');
-                    }
-
-                    const message = JSON.parse(textData);
-                    handleMessage(message);
-                } catch (error) {
-                    console.error('Failed to parse message:', error);
-                    if (debugMeta) console.error('Data meta:', debugMeta);
-                    if (typeof textData === 'string') console.error('Data preview:', textData.slice(0, 200));
-                }
-            };
-
-            ws.onclose = () => {
-                console.log('WebSocket disconnected');
-                updateStatus('disconnected', 'Disconnected');
-                setTimeout(initWebSocket, 3000); // Reconnect after 3s
-            };
-
-            ws.onerror = (error) => {
-                console.error('WebSocket error:', error);
-            };
-        }
-
-        // Handle incoming messages
-        function handleMessage(message) {
-            const { type, data } = message;
-
-            switch (type) {
-                case 'init':
-                    actionDim = message.action_space_shape;
-                    currentAction = new Array(actionDim).fill(0.0);
-                    initializeSliders();
-                    document.getElementById('statusText').textContent = `Initialized (${actionDim}-DOF)`;
-                    break;
-
-                case 'frame':
-                    document.getElementById('rgbStream').src = data.rgb;
-                    document.getElementById('depthStream').src = data.depth;
-                    break;
-
-                case 'step_result':
-                    if (data.info && data.info.current_phase) {
-                        document.getElementById('phaseIndicator').textContent = `Phase ${data.info.current_phase}`;
-                    }
-                    break;
-
-                case 'recording_status':
-                    isRecording = message.recording;
-                    updateRecordingUI();
-                    if (!isRecording && message.saved_path) {
-                        document.getElementById('statusText').textContent = `Saved: ${message.saved_path}`;
-                    }
-                    break;
-
-                case 'reset_complete':
-                    document.getElementById('statusText').textContent = 'Environment reset';
-                    break;
-
-                case 'error':
-                    updateStatus('disconnected', 'Error');
-                    document.getElementById('statusText').textContent = `Error: ${message.message}`;
-                    console.error('Server error:', message.message);
-                    break;
-
-                default:
-                    console.log('Unknown message type:', type);
-            }
-        }
+        let stepInFlight = false;
 
         // Update status badge
         function updateStatus(state, text) {
@@ -552,18 +438,106 @@
                     sendControlCommand();
                 });
             }
+
+            slidersInitialized = true;
+        }
+
+        function hasNonZeroAction() {
+            for (let i = 0; i < currentAction.length; i++) {
+                if (Math.abs(currentAction[i]) > 1e-6) return true;
+            }
+            return false;
+        }
+
+        async function apiGet(path) {
+            const resp = await fetch(path, { cache: 'no-store' });
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            return await resp.json();
+        }
+
+        async function apiPost(path, body = null) {
+            const resp = await fetch(path, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body || {}),
+            });
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            return await resp.json();
+        }
+
+        function applyStatus(status) {
+            if (!status || typeof status !== 'object') return;
+
+            // Re-init action space if needed
+            const newDim = Number(status.action_space_shape);
+            if (Number.isFinite(newDim) && newDim > 0 && newDim !== actionDim) {
+                actionDim = newDim;
+                currentAction = new Array(actionDim).fill(0.0);
+                slidersInitialized = false;
+            }
+            if (!slidersInitialized) initializeSliders();
+
+            isConnected = true;
+            serverError = status.error || null;
+            isRecording = !!status.recording;
+
+            // Phase indicator
+            if (status.current_phase) {
+                document.getElementById('phaseIndicator').textContent = `Phase ${status.current_phase}`;
+            }
+
+            // Status text
+            const statusTextEl = document.getElementById('statusText');
+            if (serverError) {
+                statusTextEl.textContent = `Error: ${serverError}`;
+            } else if (status.saved_path) {
+                statusTextEl.textContent = `Saved: ${status.saved_path}`;
+            } else if (status.step_result && typeof status.step_result.reward === 'number') {
+                statusTextEl.textContent = `Reward: ${status.step_result.reward.toFixed(3)} (Step ${status.step_i ?? 0})`;
+            } else {
+                statusTextEl.textContent = `Initialized (${actionDim}-DOF)`;
+            }
+
+            updateRecordingUI();
+        }
+
+        async function refreshStatus() {
+            try {
+                const status = await apiGet('api/status');
+                applyStatus(status);
+            } catch (e) {
+                isConnected = false;
+                serverError = null;
+                updateRecordingUI();
+                document.getElementById('statusText').textContent = 'Disconnected';
+            }
         }
 
         // Send control command
         function sendControlCommand() {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    type: 'control',
-                    command: {
-                        type: 'velocity',
-                        values: currentAction
-                    }
-                }));
+            // Low-latency "poke": try stepping immediately, but keep an interval loop
+            // running as the main driver for continuous commands.
+            stepTick();
+        }
+
+        async function stepTick() {
+            if (!isConnected) return;
+            if (stepInFlight) return;
+            if (!isRecording && !hasNonZeroAction()) return;
+
+            stepInFlight = true;
+            try {
+                const status = await apiPost('api/step', {
+                    command: { type: 'velocity', values: currentAction }
+                });
+                applyStatus(status);
+            } catch (e) {
+                isConnected = false;
+                serverError = null;
+                updateRecordingUI();
+                document.getElementById('statusText').textContent = 'Disconnected';
+            } finally {
+                stepInFlight = false;
             }
         }
 
@@ -614,36 +588,52 @@
 
         // Recording controls
         document.getElementById('startRecording').addEventListener('click', () => {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'start_recording' }));
-                isRecording = true;
-                updateRecordingUI();
-            }
+            if (!isConnected) return;
+            apiPost('api/start_recording')
+                .then(applyStatus)
+                .catch(() => {
+                    isConnected = false;
+                    updateRecordingUI();
+                });
         });
 
         document.getElementById('stopRecording').addEventListener('click', () => {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'stop_recording' }));
-                isRecording = false;
-                updateRecordingUI();
-            }
+            if (!isConnected) return;
+            apiPost('api/stop_recording')
+                .then(applyStatus)
+                .catch(() => {
+                    isConnected = false;
+                    updateRecordingUI();
+                });
         });
 
         document.getElementById('resetEnv').addEventListener('click', () => {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'reset' }));
-            }
+            if (!isConnected) return;
+            apiPost('api/reset')
+                .then(applyStatus)
+                .catch(() => {
+                    isConnected = false;
+                    updateRecordingUI();
+                });
         });
 
         function updateRecordingUI() {
-            document.getElementById('startRecording').disabled = isRecording;
-            document.getElementById('stopRecording').disabled = !isRecording;
+            document.getElementById('startRecording').disabled = !isConnected || isRecording;
+            document.getElementById('stopRecording').disabled = !isConnected || !isRecording;
 
+            if (!isConnected) {
+                updateStatus('disconnected', 'Disconnected');
+                return;
+            }
+            if (serverError) {
+                updateStatus('disconnected', 'Error');
+                return;
+            }
             if (isRecording) {
                 updateStatus('recording', '⏺ Recording');
-            } else {
-                updateStatus('connected', 'Connected');
+                return;
             }
+            updateStatus('connected', 'Connected');
         }
 
         // Keyboard controls
@@ -704,7 +694,16 @@
 
         // Initialize on page load
         window.addEventListener('load', () => {
-            initWebSocket();
+            // Set MJPEG streams (relative URLs keep reverse-proxy prefixes working)
+            document.getElementById('rgbStream').src = 'rgb.mjpg';
+            document.getElementById('depthStream').src = 'depth.mjpg';
+
+            updateRecordingUI();
+            refreshStatus();
+
+            // Status polling + continuous stepping
+            setInterval(refreshStatus, 2000);
+            setInterval(stepTick, 50); // ~20Hz stepping
         });
     </script>
 </body>
