@@ -11,10 +11,8 @@ Example:
 
 import runpy
 
-# Ensure env class is imported + registered
-from grounding_v2.envs.microwave_pick_place_layout_shift import (  # noqa: F401
-    GroundingV2MicrowavePickPlaceLayoutShift,
-)
+# Ensure grounding_v2 env modules are imported + registered
+import grounding_v2.envs  # noqa: F401
 
 
 def main() -> None:
@@ -23,4 +21,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

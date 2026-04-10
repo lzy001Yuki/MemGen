@@ -82,6 +82,8 @@ class GroundingV2MicrowavePickPlaceLayoutShift(Kitchen):
         self.exclude_obj_groups = exclude_obj_groups
         self.num_distractors = int(num_distractors)
         self.distractor_min_dist = float(distractor_min_dist)
+        auto_close_microwave_door = kwargs.pop("auto_close_microwave_door", True)
+        self.auto_close_microwave_door = bool(auto_close_microwave_door)
 
         # Per-episode runtime state (initialized in _setup_scene)
         self.stage: int = self.STAGE_A_STORE
@@ -92,8 +94,44 @@ class GroundingV2MicrowavePickPlaceLayoutShift(Kitchen):
         self.layout_shift_info: dict[str, Any] = {}
         self._mw_shift_counter_names: list[str] | None = None
         self._mw_shift_counter_name_chosen: str | None = None
+        self._pending_microwave_door_close: bool = False
 
         super().__init__(*args, **kwargs)
+
+    def _try_auto_close_microwave_door(self) -> bool:
+        """
+        Best-effort helper to close the microwave door after Stage A is completed.
+
+        We prefer closing only when the gripper is reasonably far from the microwave
+        to avoid "slamming" the door into the robot during teleoperation / scripted
+        demos. If we can't evaluate that check, we close immediately.
+        """
+        if not self.auto_close_microwave_door:
+            return True
+
+        if getattr(self, "microwave", None) is None:
+            return True
+
+        try:
+            if self.microwave.is_closed(env=self):
+                return True
+        except Exception:
+            pass
+
+        try:
+            gripper_far = OU.gripper_fxtr_far(self, self.microwave.root_body, th=0.30)
+            if not gripper_far:
+                return False
+        except Exception:
+            # If we can't compute a safety check, fall back to closing right away.
+            pass
+
+        try:
+            self.microwave.close_door(env=self)
+            self.sim.forward()
+        except Exception:
+            pass
+        return True
 
     # ---------------------------------------------------------------------
     # Kitchen references + object configs (adapted from atomic pick/place)
@@ -127,6 +165,7 @@ class GroundingV2MicrowavePickPlaceLayoutShift(Kitchen):
         # Reset runtime stage machine
         self.stage = self.STAGE_A_STORE
         self._nav_index = 0
+        self._pending_microwave_door_close = False
 
         self.layout_shift_done = False
         self.layout_shift_info = {}
@@ -229,11 +268,22 @@ class GroundingV2MicrowavePickPlaceLayoutShift(Kitchen):
     # Stage machine / success checks
     # ---------------------------------------------------------------------
     def _check_success(self):
+        # Handle deferred door closing (e.g. if the gripper was too close at the
+        # moment Stage A completed).
+        if self._pending_microwave_door_close:
+            if self._try_auto_close_microwave_door():
+                self._pending_microwave_door_close = False
+
         # Stage A: store into microwave (do NOT terminate episode)
         if self.stage == self.STAGE_A_STORE:
             if self._check_store_success():
                 self.stage = self.STAGE_DISTRACTORS
                 self._nav_index = 0
+                if self.auto_close_microwave_door:
+                    # Close immediately if safe; otherwise, defer until the gripper moves away.
+                    self._pending_microwave_door_close = True
+                    if self._try_auto_close_microwave_door():
+                        self._pending_microwave_door_close = False
             return False
 
         # Stage distractors: sequential base navigation targets
@@ -613,4 +663,3 @@ class GroundingV2MicrowavePickPlaceLayoutShift(Kitchen):
                 self.sim.data.set_joint_qpos(obj.joints[0], qpos)
             self.sim.forward()
             return
-

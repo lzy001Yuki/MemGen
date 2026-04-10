@@ -413,6 +413,37 @@ if __name__ == "__main__":
     parser.add_argument("--layout", type=int, nargs="+", default=None)
     parser.add_argument("--style", type=int, nargs="+", default=None)
     parser.add_argument("--generative_textures", action="store_true")
+
+    # Optional: save RGB snapshots when staged / long-horizon tasks advance.
+    # This is mainly intended for grounding_v2 composite tasks (e.g. drawer close / navigate / open).
+    parser.add_argument(
+        "--save_task_completion_rgb",
+        action="store_true",
+        help="If set, saves RGB images for all cameras when a staged task advances to the next subtask.",
+    )
+    parser.add_argument(
+        "--task_completion_rgb_width",
+        type=int,
+        default=256,
+        help="Width for task-completion RGB snapshots (only used if --save_task_completion_rgb).",
+    )
+    parser.add_argument(
+        "--task_completion_rgb_height",
+        type=int,
+        default=256,
+        help="Height for task-completion RGB snapshots (only used if --save_task_completion_rgb).",
+    )
+    parser.add_argument(
+        "--task_completion_rgb_out_dir",
+        type=str,
+        default=None,
+        help="Optional override directory for task-completion RGB snapshots. Default: per-episode directory when collecting demos.",
+    )
+    parser.add_argument(
+        "--task_completion_rgb_verbose",
+        action="store_true",
+        help="Print debug logs when saving task-completion RGB snapshots.",
+    )
     args = parser.parse_args()
 
     # Get controller config
@@ -488,7 +519,7 @@ if __name__ == "__main__":
     env = robosuite.make(
         **config,
         has_renderer=True,
-        has_offscreen_renderer=False,
+        has_offscreen_renderer=bool(args.save_task_completion_rgb),
         render_camera=args.camera,
         ignore_done=True,
         use_camera_obs=False,
@@ -518,6 +549,26 @@ if __name__ == "__main__":
         # wrap the environment with data collection wrapper
         all_eps_directory = os.path.join(demo_dir, "episodes")
         env = DataCollectionWrapper(env, all_eps_directory, use_env_xml_for_reset=True)
+
+    if bool(args.save_task_completion_rgb):
+        try:
+            from grounding_v2.wrappers import TaskCompletionRGBSaverWrapper
+
+            env = TaskCompletionRGBSaverWrapper(
+                env,
+                enabled=True,
+                width=int(args.task_completion_rgb_width),
+                height=int(args.task_completion_rgb_height),
+                out_dir=args.task_completion_rgb_out_dir,
+                verbose=bool(args.task_completion_rgb_verbose),
+            )
+        except Exception as e:
+            print(
+                colored(
+                    f"Warning: failed to enable --save_task_completion_rgb (skipping). Error: {e}",
+                    "yellow",
+                )
+            )
 
     # Esc toggles wall transparency; '[' / ']' force it OFF (also mjviewer camera keys).
     install_enclosing_wall_hotkeys(env)
